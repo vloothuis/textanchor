@@ -83,6 +83,11 @@ type Range struct {
 // ResolveResult contains the result of attempting to resolve an anchor.
 type ResolveResult struct {
 	// Range is the located character range. Nil if orphaned.
+	//
+	// Matching ignores whitespace differences, so this span may be a different
+	// length from the anchor's Quote — a quote the document has since rewrapped
+	// resolves to a span containing the newline. Slice the document with
+	// Range.Start and Range.End; do not compute the end as Start + len(Quote).
 	Range *Range
 
 	// Confidence is a score from 0.0 to 1.0 indicating how confident

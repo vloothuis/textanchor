@@ -128,16 +128,24 @@ const (
 	fuzzyPerfectMatch = 0.995
 )
 
-// findFuzzyMatches finds substrings in text that are similar to the query.
+// findFuzzyMatchesByParagraph finds substrings similar to query, searching each
+// paragraph of the RAW document independently.
 //
-// Each paragraph is scanned with a sliding window and judged on the BEST WINDOW
-// it contains, not on the paragraph as a whole. Scoring the whole paragraph
-// asks the wrong question: similarity is length-sensitive, so a short quote
-// inside a long paragraph scores low however exactly it appears there — a
-// 35-character quote in a 151-character paragraph scores 0.250 even when the
-// paragraph contains it verbatim. Gating on that number made the windowed
-// search unreachable in exactly the cases it was written to rescue.
-func findFuzzyMatches(text, query string, minSimilarity float64) []fuzzyMatch {
+// Each paragraph is collapsed on its own, so matching ignores the whitespace a
+// formatter rewrites while offsets map back to the raw document. Splitting
+// first is what keeps the comparison budget per-paragraph and keeps a match
+// from spanning a paragraph break.
+//
+// A paragraph is judged on the BEST WINDOW it contains, not on the paragraph as
+// a whole. Scoring the whole paragraph asks the wrong question: similarity is
+// length-sensitive, so a short quote inside a long paragraph scores low however
+// exactly it appears there — a 35-character quote in a 151-character paragraph
+// scores 0.250 even when the paragraph contains it verbatim. Gating on that
+// number made the windowed search unreachable in exactly the cases it was
+// written to rescue.
+//
+// query must already be collapsed.
+func findFuzzyMatchesByParagraph(document, query string) []fuzzyMatch {
 	var matches []fuzzyMatch
 
 	// For very short queries, don't try fuzzy matching
@@ -145,36 +153,74 @@ func findFuzzyMatches(text, query string, minSimilarity float64) []fuzzyMatch {
 		return matches
 	}
 
-	paragraphs := splitParagraphs(text)
-	offset := 0
-
-	for _, para := range paragraphs {
-		// Find the paragraph's position in the original text
-		paraStart := strings.Index(text[offset:], para)
-		if paraStart == -1 {
+	for _, para := range splitParagraphsWithOffsets(document) {
+		c := collapseWhitespace(para.text)
+		if c.text == "" {
 			continue
 		}
-		paraStart += offset
-		offset = paraStart + len(para)
 
-		// The whole paragraph is handed over in one call: bestSubstringMatch
-		// strides its start positions within a fixed comparison budget, so it
-		// already covers a long paragraph at reduced resolution rather than
-		// linearly in its length. Splitting it into chunks first would multiply
-		// that budget by the chunk count, which is what made a 60KB paragraph
-		// cost seconds.
-		match := trimMatch(bestSubstringMatch(para, query))
-		if match.similarity >= minSimilarity {
-			matches = append(matches, fuzzyMatch{
-				text:       match.text,
-				start:      paraStart + match.start,
-				end:        paraStart + match.end,
-				similarity: match.similarity,
-			})
+		match := trimMatch(bestSubstringMatch(c.text, query))
+		if match.similarity < fuzzyMinSimilarity {
+			continue
 		}
+
+		// Map the window back through this paragraph's own position map, then
+		// into the document by the paragraph's offset.
+		rng := c.sourceRange(match.start, match.end)
+		if rng.Start == rng.End {
+			continue
+		}
+		matches = append(matches, fuzzyMatch{
+			text:       para.text[rng.Start:rng.End],
+			start:      para.offset + rng.Start,
+			end:        para.offset + rng.End,
+			similarity: match.similarity,
+		})
 	}
 
 	return matches
+}
+
+// paragraph is a blank-line-delimited block together with its byte offset in
+// the document it came from.
+type paragraph struct {
+	text   string
+	offset int
+}
+
+// splitParagraphsWithOffsets splits a document into paragraphs, keeping each
+// one's offset so a match inside it can be reported in document coordinates.
+//
+// splitParagraphs returns the text only, and recovering offsets afterwards by
+// searching for each paragraph is both wasteful and wrong when two paragraphs
+// are identical.
+func splitParagraphsWithOffsets(document string) []paragraph {
+	var paragraphs []paragraph
+
+	start := -1
+	offset := 0
+	for _, line := range strings.SplitAfter(document, "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			if start >= 0 {
+				paragraphs = append(paragraphs, paragraph{
+					text:   document[start:offset],
+					offset: start,
+				})
+				start = -1
+			}
+		} else if start < 0 {
+			start = offset
+		}
+		offset += len(line)
+	}
+	if start >= 0 {
+		paragraphs = append(paragraphs, paragraph{text: document[start:offset], offset: start})
+	}
+
+	return paragraphs
 }
 
 // bestSubstringMatch finds the substring in text most similar to query.
@@ -278,6 +324,13 @@ func windowStride(textLen, size, minSize, maxSize int) int {
 // whitespace inside the span is never part of what the user selected, and it
 // would otherwise be handed back inside the resolved Range.
 func trimMatch(m fuzzyMatch) fuzzyMatch {
+	// A span that is entirely whitespace has nothing to anchor to. Returning
+	// the zero value keeps the start/end invariant explicit rather than relying
+	// on the two loops below meeting in the middle by arithmetic coincidence.
+	if strings.TrimLeft(m.text, " \t\n\r") == "" {
+		return fuzzyMatch{}
+	}
+
 	for len(m.text) > 0 && isASCIISpace(m.text[0]) {
 		m.text = m.text[1:]
 		m.start++
@@ -289,9 +342,10 @@ func trimMatch(m fuzzyMatch) fuzzyMatch {
 	return m
 }
 
-// isASCIISpace reports whether b is whitespace. The collapsed form this runs
-// over contains no whitespace other than the single ASCII space it emits, so a
-// byte test is sufficient and a rune decode would be wasted work.
+// isASCIISpace reports whether b is ASCII whitespace. A byte test is sufficient
+// because every whitespace rune has already been collapsed to a single ASCII
+// space by the time a match reaches here; the tab and newline cases cost
+// nothing and keep the helper correct if it is ever pointed at raw text.
 func isASCIISpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }

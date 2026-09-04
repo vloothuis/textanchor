@@ -1,6 +1,7 @@
 package textanchor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -209,7 +210,7 @@ func TestResolveAcrossReflowMultiByte(t *testing.T) {
 func TestFindFuzzyMatchesReachesSubstringMatch(t *testing.T) {
 	quote := "until a restart, which is confusing"
 
-	matches := findFuzzyMatches(reflowWrapped, quote, 0.6)
+	matches := findFuzzyMatchesByParagraph(reflowWrapped, quote)
 	if len(matches) == 0 {
 		t.Fatalf("findFuzzyMatches() found nothing; bestSubstringMatch scores this input at 0.971")
 	}
@@ -234,7 +235,7 @@ func TestFindFuzzyMatchesReachesSubstringMatch(t *testing.T) {
 func TestFindFuzzyMatchesRejectsAbsentText(t *testing.T) {
 	const doc = "The store writes markdown files to disk and reloads them on change.\n"
 
-	if matches := findFuzzyMatches(doc, "completely unrelated wording about billing invoices", 0.6); len(matches) > 0 {
+	if matches := findFuzzyMatchesByParagraph(doc, "completely unrelated wording about billing invoices"); len(matches) > 0 {
 		t.Errorf("findFuzzyMatches() = %d matches, want 0 (best %.3f %q)",
 			len(matches), matches[0].similarity, matches[0].text)
 	}
@@ -247,4 +248,61 @@ func isRuneBoundary(s string, offset int) bool {
 	}
 	// Continuation bytes are 0b10xxxxxx; anything else starts a rune.
 	return s[offset]&0xC0 != 0x80
+}
+
+// TestResolveScalesWithDocumentSize pins the fuzzy phase's per-paragraph
+// budgeting.
+//
+// The comparison budget bounds work per paragraph. Collapsing the whole
+// document before splitting would turn the blank line between paragraphs into
+// an ordinary space, leaving splitParagraphs to find a single paragraph and
+// silently converting that per-paragraph budget into a per-document one. The
+// search would then stride ever more coarsely as the document grew — resolving
+// at 194 bytes, returning a wrong span in the middle, and hard-orphaning by
+// ~50KB. Confidence must not depend on how much unrelated text surrounds the
+// quote.
+func TestResolveScalesWithDocumentSize(t *testing.T) {
+	// One edit away from the document text, so the exact phase misses and the
+	// fuzzy phase is what has to find it.
+	const quote = "the audit log records every successful write to the tree today"
+	const target = "the audit log records every successful write to the graph today"
+
+	for _, paragraphs := range []int{1, 50, 400, 2000} {
+		t.Run(fmt.Sprintf("%d_paragraphs", paragraphs), func(t *testing.T) {
+			var sb strings.Builder
+			for i := 0; i < paragraphs; i++ {
+				fmt.Fprintf(&sb, "Paragraph %d: the store writes markdown files to disk "+
+					"and reloads them on change when the watcher fires.\n\n", i)
+			}
+			sb.WriteString(target)
+			sb.WriteString("\n")
+			doc := sb.String()
+
+			res := Resolve(doc, Anchor{Quote: quote, ParagraphIndex: -1}, nil)
+			if res.Orphaned {
+				t.Fatalf("orphaned (%s) in a %d-byte document; the same quote resolves when the "+
+					"document is short, so the budget is being diluted by document length",
+					res.OrphanReason, len(doc))
+			}
+			if got := doc[res.Range.Start:res.Range.End]; got != target {
+				t.Errorf("resolved to %q, want %q", got, target)
+			}
+		})
+	}
+}
+
+// TestResolveSpansBlockBoundary guards the other half of the split: the exact
+// phase deliberately matches across a blank line, because a selection dragged
+// from a heading into the body is a supported case.
+func TestResolveSpansBlockBoundary(t *testing.T) {
+	const doc = "# Configuration\n\nConfigure the package by creating a config file.\n"
+	const want = "Configuration\n\nConfigure the package"
+
+	res := Resolve(doc, Anchor{Quote: "Configuration Configure the package", ParagraphIndex: -1}, nil)
+	if res.Orphaned {
+		t.Fatalf("orphaned (%s); a selection spanning a heading and its body must resolve", res.OrphanReason)
+	}
+	if got := doc[res.Range.Start:res.Range.End]; got != want {
+		t.Errorf("resolved to %q, want %q", got, want)
+	}
 }

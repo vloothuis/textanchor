@@ -130,19 +130,28 @@ func ResolveAll(document string, anchors []Anchor, opts *ResolveOptions) []Resol
 	return results
 }
 
-// findCandidates finds all potential matches for an anchor's quote against an
-// already-collapsed document.
+// findCandidates finds all potential matches for an anchor's quote.
 //
-// Both phases run over the collapsed form and map their results back through
-// doc.sourceRange, so a quote whose whitespace has been rewritten — the case a
-// Markdown formatter creates every time it rewraps a paragraph — is found by
-// the cheap exact phase instead of falling through to fuzzy matching or
-// orphaning outright. The caller collapses the document once and reuses it for
-// scoring, which is why this takes the collapsed form rather than the string.
+// Matching is whitespace-insensitive throughout while every returned Range is
+// in original document coordinates, so a quote whose whitespace a Markdown
+// formatter has rewritten — the case that arises every time a paragraph is
+// rewrapped — is found by the cheap exact phase rather than falling through to
+// fuzzy matching or orphaning outright.
+//
+// The two phases differ in scope, which the comments at each explain: phase 1
+// runs over the whole collapsed document, phase 2 per paragraph. The caller
+// collapses the document once and reuses it for scoring, which is why this
+// takes the collapsed form rather than the string.
 func findCandidates(doc collapsed, anchor Anchor) []candidate {
 	var candidates []candidate
 
-	// Phase 1: Exact quote matching, whitespace-insensitive.
+	// Phase 1: Exact quote matching, whitespace-insensitive, over the whole
+	// collapsed document. Matching across block boundaries is deliberate here:
+	// a selection dragged from a heading into the body spans a blank line, and
+	// relocating that is a supported case (see the quotefind subpackage, which
+	// exists to turn such a selection into source offsets). An exact match on
+	// the full quote is specific enough to carry that freedom; the fuzzy phase
+	// below is not, which is why it stays inside one paragraph.
 	quote := collapseWhitespace(anchor.Quote).text
 	if quote == "" {
 		return nil
@@ -161,12 +170,22 @@ func findCandidates(doc collapsed, anchor Anchor) []candidate {
 		offset = start + 1 // Allow overlapping matches
 	}
 
-	// Phase 2: Fuzzy quote matching if no exact matches
+	// Phase 2: Fuzzy quote matching if no exact matches.
+	//
+	// This runs over the RAW document, collapsing each paragraph separately,
+	// rather than over doc.text. Collapsing the whole document first turns the
+	// blank line between paragraphs into an ordinary space, which destroys the
+	// structure the fuzzy phase is built on: splitParagraphs would find exactly
+	// one paragraph however many the document has. Two things then go wrong.
+	// The per-paragraph comparison budget becomes a per-DOCUMENT budget, so the
+	// search strides ever more coarsely as the document grows and eventually
+	// orphans a quote it can plainly see — the very failure this package is
+	// meant to prevent. And a match becomes free to span a paragraph break it
+	// could never really have spanned.
 	if len(candidates) == 0 {
-		fuzzyMatches := findFuzzyMatches(doc.text, quote, fuzzyMinSimilarity)
-		for _, match := range fuzzyMatches {
+		for _, match := range findFuzzyMatchesByParagraph(doc.original, quote) {
 			candidates = append(candidates, candidate{
-				rng:   doc.sourceRange(match.start, match.end),
+				rng:   Range{Start: match.start, End: match.end},
 				score: match.similarity * 0.8, // Penalty for fuzzy match
 			})
 		}

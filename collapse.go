@@ -86,15 +86,26 @@ func collapseWhitespace(s string) collapsed {
 // whitespace, whose map entry points at the start of that run, which would cut
 // the span short. Taking the last included byte and walking to the end of its
 // rune keeps the returned range on rune boundaries.
+// An out-of-range or empty span returns the zero Range rather than panicking:
+// this is a mapping helper, and a caller that asks about a span that is not
+// there wants "nothing" back, not a crash.
 func (c collapsed) sourceRange(start, end int) Range {
-	if len(c.posMap) == 0 || start >= end {
-		return Range{}
-	}
+	// Clamp both ends into c.text before either is used as an index. Clamping
+	// start only against negatives would still admit an offset past the end,
+	// which indexes posMap out of range; clamping end without re-checking the
+	// ordering would then let end-1 reach -1 on an empty collapsed form (which
+	// every all-whitespace input produces).
 	if start < 0 {
 		start = 0
 	}
+	if start > len(c.text) {
+		start = len(c.text)
+	}
 	if end > len(c.text) {
 		end = len(c.text)
+	}
+	if start >= end || end <= 0 {
+		return Range{}
 	}
 
 	srcStart := c.posMap[start]
