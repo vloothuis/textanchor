@@ -24,7 +24,11 @@ func Resolve(document string, anchor Anchor, opts *ResolveOptions) ResolveResult
 		opts = DefaultResolveOptions()
 	}
 
-	candidates := findCandidates(document, anchor)
+	// Collapse once and reuse for both finding and scoring: every candidate
+	// needs the collapsed document, and rebuilding it per candidate allocates a
+	// copy of the document plus its position map each time.
+	collapsedDoc := collapseWhitespace(document)
+	candidates := findCandidates(collapsedDoc, anchor)
 
 	if len(candidates) == 0 {
 		return ResolveResult{
@@ -35,7 +39,9 @@ func Resolve(document string, anchor Anchor, opts *ResolveOptions) ResolveResult
 
 	// Score candidates by context
 	for i := range candidates {
-		candidates[i].score = scoreCandidate(document, anchor, candidates[i], opts)
+		candidates[i].score = scoreCandidateWithCache(
+			document, anchor, candidates[i], opts, nil, nil, collapsedDoc.text,
+		)
 	}
 
 	// Find the best candidate
@@ -75,9 +81,12 @@ func ResolveAll(document string, anchors []Anchor, opts *ResolveOptions) []Resol
 	// This is shared across all resolutions
 	headingPositions := extractHeadingPositions(document)
 	paragraphBoundaries := extractParagraphBoundaries(document)
+	// Collapsing is per-document work, so it is hoisted out of the loop for the
+	// same reason the structural analysis above is.
+	collapsedDoc := collapseWhitespace(document)
 
 	for i, anchor := range anchors {
-		candidates := findCandidates(document, anchor)
+		candidates := findCandidates(collapsedDoc, anchor)
 
 		if len(candidates) == 0 {
 			results[i] = ResolveResult{
@@ -91,7 +100,7 @@ func ResolveAll(document string, anchors []Anchor, opts *ResolveOptions) []Resol
 		for j := range candidates {
 			candidates[j].score = scoreCandidateWithCache(
 				document, anchor, candidates[j], opts,
-				headingPositions, paragraphBoundaries,
+				headingPositions, paragraphBoundaries, collapsedDoc.text,
 			)
 		}
 
@@ -121,22 +130,32 @@ func ResolveAll(document string, anchors []Anchor, opts *ResolveOptions) []Resol
 	return results
 }
 
-// findCandidates finds all potential matches for an anchor's quote.
-func findCandidates(document string, anchor Anchor) []candidate {
+// findCandidates finds all potential matches for an anchor's quote against an
+// already-collapsed document.
+//
+// Both phases run over the collapsed form and map their results back through
+// doc.sourceRange, so a quote whose whitespace has been rewritten — the case a
+// Markdown formatter creates every time it rewraps a paragraph — is found by
+// the cheap exact phase instead of falling through to fuzzy matching or
+// orphaning outright. The caller collapses the document once and reuses it for
+// scoring, which is why this takes the collapsed form rather than the string.
+func findCandidates(doc collapsed, anchor Anchor) []candidate {
 	var candidates []candidate
 
-	// Phase 1: Exact quote matching
-	quote := anchor.Quote
+	// Phase 1: Exact quote matching, whitespace-insensitive.
+	quote := collapseWhitespace(anchor.Quote).text
+	if quote == "" {
+		return nil
+	}
 	offset := 0
 	for {
-		idx := strings.Index(document[offset:], quote)
+		idx := strings.Index(doc.text[offset:], quote)
 		if idx == -1 {
 			break
 		}
 		start := offset + idx
-		end := start + len(quote)
 		candidates = append(candidates, candidate{
-			rng:   Range{Start: start, End: end},
+			rng:   doc.sourceRange(start, start+len(quote)),
 			score: 1.0, // Start with perfect score for exact match
 		})
 		offset = start + 1 // Allow overlapping matches
@@ -144,10 +163,10 @@ func findCandidates(document string, anchor Anchor) []candidate {
 
 	// Phase 2: Fuzzy quote matching if no exact matches
 	if len(candidates) == 0 {
-		fuzzyMatches := findFuzzyMatches(document, quote, 0.6)
+		fuzzyMatches := findFuzzyMatches(doc.text, quote, fuzzyMinSimilarity)
 		for _, match := range fuzzyMatches {
 			candidates = append(candidates, candidate{
-				rng:   Range{Start: match.start, End: match.end},
+				rng:   doc.sourceRange(match.start, match.end),
 				score: match.similarity * 0.8, // Penalty for fuzzy match
 			})
 		}
@@ -158,10 +177,12 @@ func findCandidates(document string, anchor Anchor) []candidate {
 
 // scoreCandidate scores a candidate based on context matching.
 func scoreCandidate(document string, anchor Anchor, c candidate, opts *ResolveOptions) float64 {
-	return scoreCandidateWithCache(document, anchor, c, opts, nil, nil)
+	return scoreCandidateWithCache(document, anchor, c, opts, nil, nil, "")
 }
 
-// scoreCandidateWithCache scores a candidate with optional cached document structure.
+// scoreCandidateWithCache scores a candidate with optional cached document
+// structure. collapsedText is the whitespace-collapsed document; pass "" to
+// have it computed here.
 func scoreCandidateWithCache(
 	document string,
 	anchor Anchor,
@@ -169,6 +190,7 @@ func scoreCandidateWithCache(
 	opts *ResolveOptions,
 	headingPositions []headingPos,
 	paragraphBoundaries []int,
+	collapsedText string,
 ) float64 {
 	// Start with the base score (1.0 for exact match, lower for fuzzy)
 	baseScore := c.score
@@ -180,8 +202,11 @@ func scoreCandidateWithCache(
 		if prefixStart < 0 {
 			prefixStart = 0
 		}
-		actualPrefix := document[prefixStart:c.rng.Start]
-		prefixScore = similarity(actualPrefix, anchor.Prefix)
+		// Collapse both sides: the surrounding context is subject to the same
+		// rewrapping as the quote, so a raw comparison would penalise a correct
+		// match purely for a newline the formatter moved.
+		actualPrefix := collapseWhitespace(document[prefixStart:c.rng.Start]).text
+		prefixScore = similarity(actualPrefix, collapseWhitespace(anchor.Prefix).text)
 	} else {
 		prefixScore = 1.0 // No prefix to match
 	}
@@ -193,8 +218,8 @@ func scoreCandidateWithCache(
 		if suffixEnd > len(document) {
 			suffixEnd = len(document)
 		}
-		actualSuffix := document[c.rng.End:suffixEnd]
-		suffixScore = similarity(actualSuffix, anchor.Suffix)
+		actualSuffix := collapseWhitespace(document[c.rng.End:suffixEnd]).text
+		suffixScore = similarity(actualSuffix, collapseWhitespace(anchor.Suffix).text)
 	} else {
 		suffixScore = 1.0 // No suffix to match
 	}
@@ -216,9 +241,15 @@ func scoreCandidateWithCache(
 		structuralScore = 0.5 // Neutral if not using structural matching
 	}
 
-	// Calculate uniqueness bonus
+	// Calculate uniqueness bonus. Counting over the collapsed forms keeps this
+	// consistent with how the candidate was found: counting raw would report
+	// zero occurrences of a quote that only matches after rewrapping, handing a
+	// correct match the same bonus as a non-existent one.
 	uniquenessBonus := 0.0
-	occurrences := strings.Count(document, anchor.Quote)
+	if collapsedText == "" {
+		collapsedText = collapseWhitespace(document).text
+	}
+	occurrences := strings.Count(collapsedText, collapseWhitespace(anchor.Quote).text)
 	if occurrences == 1 {
 		uniquenessBonus = 1.0
 	} else if occurrences > 0 {
