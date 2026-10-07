@@ -123,6 +123,10 @@ const (
 	// rather than by benchmark alone.
 	fuzzyMaxComparisons = 4096
 
+	// fuzzyPenalty scales a fuzzy candidate's quote score, so an exact match
+	// of the same text always outranks it.
+	fuzzyPenalty = 0.8
+
 	// fuzzyPerfectMatch is the score at or above which the search stops early;
 	// nothing better is worth paying for.
 	fuzzyPerfectMatch = 0.995
@@ -146,6 +150,12 @@ const (
 //
 // query must already be collapsed.
 func findFuzzyMatchesByParagraph(document, query string) []fuzzyMatch {
+	return findFuzzyMatchesInChunks(NewDocument(document).chunks, query)
+}
+
+// findFuzzyMatchesInChunks is [findFuzzyMatchesByParagraph] over a prepared
+// paragraph table.
+func findFuzzyMatchesInChunks(chunks []chunk, query string) []fuzzyMatch {
 	var matches []fuzzyMatch
 
 	// For very short queries, don't try fuzzy matching
@@ -153,11 +163,8 @@ func findFuzzyMatchesByParagraph(document, query string) []fuzzyMatch {
 		return matches
 	}
 
-	for _, para := range splitParagraphsWithOffsets(document) {
-		c := collapseWhitespace(para.text)
-		if c.text == "" {
-			continue
-		}
+	for _, ch := range chunks {
+		para, c := ch.paragraph, ch.c
 
 		match := trimMatch(bestSubstringMatch(c.text, query))
 		if match.similarity < fuzzyMinSimilarity {

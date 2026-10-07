@@ -46,12 +46,18 @@ default:
 }
 ```
 
-Resolving many anchors against one document is cheaper in a single call, which
-hoists the per-document structural analysis out of the loop:
+Resolving many anchors against one document is cheaper with a prepared
+document, which builds the per-document structures once:
 
 ```go
-results := textanchor.ResolveAll(document, anchors, nil)
+doc := textanchor.NewDocument(document)
+for _, a := range anchors {
+    res := doc.Resolve(a, nil)
+    // ...
+}
 ```
+
+`textanchor.ResolveAll(document, anchors, nil)` does the same in one call.
 
 ## What an anchor stores
 
@@ -69,8 +75,17 @@ quote matching alone.
 ## How resolution works
 
 1. **Candidates.** Every exact occurrence of `Quote`. If there are none, fall
-   back to fuzzy matching (paragraph-scoped, sliding window at ±25% of the quote
-   length) with a 0.8 penalty applied to the resulting score.
+   back to fuzzy matching, with a 0.8 penalty applied to the resulting score:
+   - **Within a paragraph:** a sliding window at ±25% of the quote length.
+   - **Across paragraphs**, for a quote that spans a blank line (a heading and
+     its body, say): the quote's first paragraph is matched against the end of
+     a document paragraph, its last paragraph against the start of a later
+     one, and what lies between is compared as a whole. Each paragraph
+     inserted or removed in the middle costs 0.15. Both ends, and their
+     length-weighted combination, must reach 0.6 similarity, so surrounding
+     context alone can never place an anchor.
+
+   Both fuzzy kinds compete on score.
 2. **Scoring.** Each candidate is scored:
 
    ```
@@ -109,9 +124,26 @@ Use `quotefind.FindWithContext` when the selection may occur more than once, and
 `quotefind.RenderedTextWithMapping` if you need the rendered text and position
 map to do your own matching.
 
+To highlight a resolved range that spans several blocks, split it with
+`quotefind.Segments` and wrap each part separately. One inline element cannot
+cross a block boundary: the HTML parser closes it at the first block end.
+
+```go
+for _, seg := range quotefind.Segments(markdownSource, res.Range.Start, res.Range.End) {
+    // wrap markdownSource[seg.Start:seg.End]
+}
+```
+
+Each segment is cut to one block's inline content, so block markup (`## `,
+`- `, `[ ] `) stays outside it, and code spans, code blocks and HTML blocks are
+left out. The parser has GitHub-flavoured tables, task lists and strikethrough
+enabled, matching a GFM renderer.
+
 ## Notes
 
 - Offsets are **byte** offsets, matching Go's string indexing.
+- Cross-paragraph fuzzy matching needs the quote in source form, with its blank
+  lines. A quote without them is treated as one paragraph.
 - Normalise your documents consistently. If your storage layer reformats
   Markdown (re-wrapping paragraphs, for instance), run the same normalisation
   before creating an anchor and before resolving one, or anchors will orphan on
