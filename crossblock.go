@@ -38,6 +38,12 @@ const (
 	// endpoint is aligned by the part nearest the block boundary; its far edge
 	// is then placed by length, which may be off by the length of an edit.
 	crossBlockEndpointRunes = 512
+
+	// crossBlockExactBelow is the endpoint length, in runes, under which an
+	// endpoint must match exactly. A short endpoint is usually a heading, and
+	// the similarity floor admits two edits in five runes, enough for "Risks"
+	// to match the tail of "tasks" in an unrelated paragraph.
+	crossBlockExactBelow = 12
 )
 
 // findCrossBlock finds fuzzy candidates for a quote that spans several
@@ -56,8 +62,9 @@ const (
 //   - Each paragraph inserted or deleted in the middle costs
 //     crossBlockGapPenalty.
 //
-// The result is accepted only if each endpoint AND the length-weighted
-// combination reach fuzzyMinSimilarity. Context scoring later adds up to 0.6
+// The result is accepted only if each endpoint, the middle, AND the
+// length-weighted combination reach fuzzyMinSimilarity, and an endpoint shorter
+// than crossBlockExactBelow matches exactly. Context scoring later adds up to 0.6
 // for prefix, suffix and structure, so without this floor surrounding text
 // alone could place an anchor on unrelated content.
 //
@@ -163,27 +170,36 @@ func screenPairs(al *aligner, chunks []chunk, first, last []rune, k int) []pair 
 func evaluatePair(
 	al *aligner, chunks []chunk, i, j int, first, last []rune, middle string, k int,
 ) (candidate, bool) {
-	start, s0 := locateStart(al, chunks[i], first)
-	end, sk := locateEnd(al, chunks[j], last)
-	if s0 < fuzzyMinSimilarity || sk < fuzzyMinSimilarity {
+	start, e0 := locateStart(al, chunks[i], first)
+	end, ek := locateEnd(al, chunks[j], last)
+	if !e0.holds(len(first)) || !ek.holds(len(last)) {
 		return candidate{}, false
 	}
 
-	w0, wk := float64(len(first)), float64(len(last))
-	sum, weight := w0*s0+wk*sk, w0+wk
+	// Each endpoint counts by the runes actually compared, not its full
+	// length: an unchecked stretch is no evidence either way.
+	sum, weight := e0.weight*e0.sim+ek.weight*ek.sim, e0.weight+ek.weight
 
 	// The middle counts by the QUOTE's middle length. A paragraph inserted
 	// into a range that had no middle is charged by the gap penalty below, not
 	// here, where it would weigh in at its own length and sink a range whose
 	// endpoints are intact.
+	//
+	// A quote WITH a middle needs that middle to be recognisably present on
+	// its own. Folded into the total, a short middle ("Do not reboot.") is
+	// outweighed by long intact endpoints, and the anchor would land on
+	// whatever replaced it.
 	if middle != "" {
+		if j == i+1 {
+			return candidate{}, false
+		}
 		var docMiddle []string
 		for n := i + 1; n < j; n++ {
 			docMiddle = append(docMiddle, chunks[n].c.text)
 		}
-		sm := 0.0
-		if len(docMiddle) > 0 {
-			sm = similarity(middle, strings.Join(docMiddle, " "))
+		sm := similarity(middle, strings.Join(docMiddle, " "))
+		if sm < fuzzyMinSimilarity {
+			return candidate{}, false
 		}
 		wm := float64(len([]rune(middle)))
 		sum += wm * sm
@@ -203,40 +219,77 @@ func evaluatePair(
 	return candidate{rng: rng, score: score * fuzzyPenalty}, true
 }
 
+// endpointMatch is how well an endpoint aligned: its similarity over the
+// weight runes that were compared.
+type endpointMatch struct {
+	sim    float64
+	weight float64
+}
+
+// holds reports whether an endpoint of n runes matched well enough to count.
+func (m endpointMatch) holds(n int) bool {
+	if n < crossBlockExactBelow {
+		return m.sim == 1
+	}
+	return m.sim >= fuzzyMinSimilarity
+}
+
+// combine merges the match of an endpoint's far edge into m.
+func (m endpointMatch) combine(far endpointMatch) endpointMatch {
+	w := m.weight + far.weight
+	return endpointMatch{sim: (m.sim*m.weight + far.sim*far.weight) / w, weight: w}
+}
+
 // locateStart finds where the start endpoint q begins in ch, aligning q
 // against the end of the paragraph. Returns a byte offset into ch's RAW text
-// and the alignment similarity.
-func locateStart(al *aligner, ch chunk, q []rune) (int, float64) {
+// and how well it matched.
+//
+// An endpoint longer than crossBlockEndpointRunes is aligned by its tail, next
+// to the block boundary, and its start is placed by length. The text at that
+// start is then checked against the endpoint's head, so a paragraph whose
+// beginning was rewritten does not pass on its intact tail alone.
+func locateStart(al *aligner, ch chunk, q []rune) (int, endpointMatch) {
 	probe := tailRunes(q, crossBlockEndpointRunes)
 	n, sim := al.atEnd(probe, ch.runes)
-	// n runes from the end match the probe; the part of q the probe left out
-	// extends further back by its length.
+	m := endpointMatch{sim: sim, weight: float64(len(probe))}
 	from := len(ch.runes) - n - (len(q) - len(probe))
 	if from < 0 {
 		from = 0
+	}
+	if rest := q[:len(q)-len(probe)]; len(rest) > 0 {
+		far := headRunes(rest, crossBlockEndpointRunes)
+		_, farSim := al.atStart(far, ch.runes[from:])
+		m = m.combine(endpointMatch{sim: farSim, weight: float64(len(far))})
 	}
 	for from < len(ch.runes) && ch.runes[from] == ' ' {
 		from++
 	}
 	b := ch.runeByte[from]
-	return ch.c.sourceRange(b, len(ch.c.text)).Start, sim
+	return ch.c.sourceRange(b, len(ch.c.text)).Start, m
 }
 
 // locateEnd finds where the end endpoint q ends in ch, aligning q against the
 // start of the paragraph. Returns an exclusive byte offset into ch's RAW text
-// and the alignment similarity.
-func locateEnd(al *aligner, ch chunk, q []rune) (int, float64) {
+// and how well it matched. A long endpoint is checked at its far edge as in
+// [locateStart].
+func locateEnd(al *aligner, ch chunk, q []rune) (int, endpointMatch) {
 	probe := headRunes(q, crossBlockEndpointRunes)
 	n, sim := al.atStart(probe, ch.runes)
+	m := endpointMatch{sim: sim, weight: float64(len(probe))}
 	to := n + (len(q) - len(probe))
 	if to > len(ch.runes) {
 		to = len(ch.runes)
+	}
+	if rest := q[len(probe):]; len(rest) > 0 {
+		far := tailRunes(rest, crossBlockEndpointRunes)
+		_, farSim := al.atEnd(far, ch.runes[:to])
+		m = m.combine(endpointMatch{sim: farSim, weight: float64(len(far))})
 	}
 	for to > 0 && ch.runes[to-1] == ' ' {
 		to--
 	}
 	b := ch.runeByte[to]
-	return ch.c.sourceRange(0, b).End, sim
+	return ch.c.sourceRange(0, b).End, m
 }
 
 // aligner computes endpoint alignments, reusing its buffers across calls.
@@ -303,10 +356,12 @@ func (a *aligner) align(q, t []rune) (int, float64) {
 		prev, cur = cur, prev
 	}
 
+	// On a tie the longer match wins, so a start is not placed inside a word
+	// when the runes before it score the same.
 	bestN, bestSim := 0, 0.0
 	for n := 1; n <= len(t); n++ {
 		sim := 1 - float64(prev[n])/float64(max(len(q), n))
-		if sim > bestSim {
+		if sim > 0 && sim >= bestSim {
 			bestN, bestSim = n, sim
 		}
 	}

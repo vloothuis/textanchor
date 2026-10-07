@@ -19,10 +19,12 @@ type Range struct {
 
 // newParser returns the parser every function in this package uses.
 //
-// The GFM block and inline extensions are enabled so the AST matches what a
-// GitHub-flavoured renderer (marked with gfm: true, for instance) shows the
-// user. Without the table extension a table is one paragraph, and a highlight
-// over two cells would be one range straddling the cell boundary.
+// The GFM table, strikethrough and task-list extensions are enabled so the
+// block structure matches a GitHub-flavoured renderer (marked with gfm: true,
+// for instance). Without the table extension a table is one paragraph, and a
+// highlight over two cells would be one range straddling the cell boundary.
+// Linkify is not enabled: a bare URL is plain text here and a link in such a
+// renderer, which changes no block boundary.
 func newParser() parser.Parser {
 	return goldmark.New(goldmark.WithExtensions(
 		extension.Table,
@@ -38,11 +40,14 @@ type Document struct {
 	blocks []textBlock
 }
 
-// textBlock is a leaf block that holds inline text: its content span and the
-// code spans inside it.
+// textBlock is a leaf block that holds inline text: its content span, the
+// code spans inside it, and its inline containers.
 type textBlock struct {
 	content Range
 	code    []Range
+	// inline holds each emphasis, link, image and strikethrough as the range
+	// from its opening delimiter to the end of its last text.
+	inline []Range
 }
 
 // NewDocument parses source for segmenting.
@@ -77,11 +82,11 @@ func newTextBlock(n ast.Node, src []byte) (textBlock, bool) {
 
 	// A task item's "[ ] " is part of its first line but is not text: marked
 	// recognises it only at the very start of the item, so a mark in front of
-	// it turns the checkbox into literal brackets.
+	// it turns the checkbox into literal brackets. It is skipped in the source
+	// rather than by jumping to the first text node, which would land inside
+	// the "**" of an item that starts with emphasis.
 	if first := n.FirstChild(); first != nil && first.Kind() == extast.KindTaskCheckBox {
-		if t := firstText(first.NextSibling()); t != nil {
-			content.Start = t.Segment.Start
-		}
+		content.Start = skipCheckBox(src, content.Start)
 	}
 
 	content = trimRange(src, content)
@@ -91,15 +96,98 @@ func newTextBlock(n ast.Node, src []byte) (textBlock, bool) {
 
 	b := textBlock{content: content}
 	_ = ast.Walk(n, func(c ast.Node, entering bool) (ast.WalkStatus, error) {
-		if entering && c.Kind() == ast.KindCodeSpan {
+		if !entering {
+			return ast.WalkContinue, nil
+		}
+		if c.Kind() == ast.KindCodeSpan {
 			if r, ok := codeSpanRange(c, src); ok {
 				b.code = append(b.code, r)
 			}
 			return ast.WalkSkipChildren, nil
 		}
+		if _, ok := delimiter(c); ok {
+			open, okOpen := openOf(c, src)
+			last := lastText(c)
+			if okOpen && last != nil {
+				b.inline = append(b.inline, Range{Start: open, End: last.Segment.Stop})
+			}
+		}
 		return ast.WalkContinue, nil
 	})
 	return b, true
+}
+
+// skipCheckBox returns the offset after a task item's "[ ]" or "[x]" and the
+// blanks that follow it, or at unchanged when the source has no checkbox there.
+func skipCheckBox(src []byte, at int) int {
+	if at+3 > len(src) || src[at] != '[' || src[at+2] != ']' {
+		return at
+	}
+	at += 3
+	for at < len(src) && (src[at] == ' ' || src[at] == '\t') {
+		at++
+	}
+	return at
+}
+
+// delimiter returns the characters an inline container's opening delimiter
+// is made of, and whether n is such a container.
+func delimiter(n ast.Node) (string, bool) {
+	switch n.Kind() {
+	case ast.KindEmphasis:
+		return "*_", true
+	case ast.KindLink:
+		return "[", true
+	case ast.KindImage:
+		return "![", true
+	case extast.KindStrikethrough:
+		return "~", true
+	}
+	return "", false
+}
+
+// openOf returns where n begins in the source, delimiters included. goldmark
+// records positions only on text, so a container's start is found by taking
+// its first child's start and stepping back over its opening delimiter, which
+// is checked to consist of the expected characters. ok is false when n's start
+// cannot be determined that way.
+func openOf(n ast.Node, src []byte) (int, bool) {
+	switch n.Kind() {
+	case ast.KindText:
+		return n.(*ast.Text).Segment.Start, true
+	case ast.KindCodeSpan:
+		r, ok := codeSpanRange(n, src)
+		return r.Start, ok
+	}
+	chars, ok := delimiter(n)
+	if !ok || n.FirstChild() == nil {
+		return 0, false
+	}
+	at, ok := openOf(n.FirstChild(), src)
+	if !ok {
+		return 0, false
+	}
+	width := 1
+	switch e := n.(type) {
+	case *ast.Emphasis:
+		width = e.Level
+	case *ast.Image:
+		width = 2
+	case *extast.Strikethrough:
+		width = 0
+		for at-width-1 >= 0 && src[at-width-1] == '~' && width < 2 {
+			width++
+		}
+	}
+	if width == 0 || at-width < 0 {
+		return 0, false
+	}
+	for _, c := range src[at-width : at] {
+		if !strings.ContainsRune(chars, rune(c)) {
+			return 0, false
+		}
+	}
+	return at - width, true
 }
 
 // Segments splits source[start:end] into one range per block of text it
@@ -112,9 +200,10 @@ func newTextBlock(n ast.Node, src []byte) (textBlock, bool) {
 // Each segment is the range cut to one block's inline CONTENT, which excludes
 // block markup such as "## ", "- " and "[ ] ". A block the range covers whole
 // gets its whole content, delimiters included, so emphasis or a link at the
-// block's edge stays balanced inside the segment. Only the range's own start
-// and end are kept as given; if the caller placed them inside inline markup,
-// that is the caller's selection.
+// block's edge stays balanced inside the segment. A start inside emphasis or a
+// link that the segment runs past is moved to the opening delimiter; an end
+// inside one is kept, since an HTML parser reopens the formatting after the
+// mark closes. No segment edge sits next to an escaping backslash.
 //
 // Code is cut out: inline HTML inside a code span renders literally. Code
 // blocks and HTML blocks produce no segment at all, for the same reason.
@@ -145,13 +234,64 @@ func (d *Document) Segments(start, end int) []Range {
 			break
 		}
 		r := Range{Start: max(start, b.content.Start), End: min(end, b.content.End)}
+		r.Start = b.liftStart(r)
 		for _, piece := range subtract(r, b.code) {
-			if piece = trimRange([]byte(d.source), piece); piece.Start < piece.End {
+			if piece = d.clean(piece); piece.Start < piece.End {
 				out = append(out, piece)
 			}
 		}
 	}
 	return out
+}
+
+// liftStart moves r's start out of any inline container that r leaves before
+// the container ends, to the container's opening delimiter. A segment starting
+// inside "**important** text" would otherwise open a mark inside the strong
+// element and close it outside, and the HTML parser ends the mark at
+// </strong>. A segment that stays inside one container is balanced already.
+// Repeated until nothing moves, which lifts out of nested containers too.
+func (b textBlock) liftStart(r Range) int {
+	start := r.Start
+	for moved := true; moved; {
+		moved = false
+		for _, c := range b.inline {
+			if c.Start < start && start < c.End && r.End > c.End {
+				start, moved = c.Start, true
+			}
+		}
+	}
+	return start
+}
+
+// clean trims a segment's whitespace and keeps its edges off a backslash that
+// escapes the next character. A segment ending in such a backslash would
+// escape the "<" of the closing tag inserted after it, and the reader would
+// see "</mark>" as text; one starting right after it would escape the "<" of
+// the opening tag. The end is pulled back before the backslash and the start
+// is moved back onto it.
+func (d *Document) clean(r Range) Range {
+	src := []byte(d.source)
+	r = trimRange(src, r)
+	if r.Start < r.End && escapes(src, r.End-1) {
+		r = trimRange(src, Range{Start: r.Start, End: r.End - 1})
+	}
+	if r.Start < r.End && r.Start > 0 && escapes(src, r.Start-1) {
+		r.Start--
+	}
+	return r
+}
+
+// escapes reports whether src[i] is a backslash that escapes the character
+// after it: one preceded by an even number of backslashes.
+func escapes(src []byte, i int) bool {
+	if src[i] != '\\' {
+		return false
+	}
+	n := 0
+	for j := i - 1; j >= 0 && src[j] == '\\'; j-- {
+		n++
+	}
+	return n%2 == 0
 }
 
 // subtract returns r minus every range in cut, in order. cut is sorted and

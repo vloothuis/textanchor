@@ -94,23 +94,23 @@ func findCandidates(d *Document, anchor Anchor) []candidate {
 	if len(candidates) > 0 {
 		return candidates
 	}
+	// Phase 3: a quote spanning several paragraphs, matched end by end. Such
+	// a quote is phase 3's alone. Phase 2 never crosses a blank line, so the
+	// best it can offer is part of the quote: one paragraph that resembles it,
+	// often scoring above the floor on its own while the text the comment was
+	// about is gone. Placing the anchor there is worse than orphaning it. The
+	// one case this gives up is paragraphs merged since the anchor was made
+	// AND edited; merged but unedited still matches exactly in phase 1.
+	if len(quoteChunks(anchor.Quote)) >= 2 {
+		return findCrossBlock(d, anchor.Quote)
+	}
 	for _, match := range findFuzzyMatchesInChunks(d.chunks, quote) {
 		candidates = append(candidates, candidate{
 			rng:   Range{Start: match.start, End: match.end},
 			score: match.similarity * fuzzyPenalty,
 		})
 	}
-
-	// Phase 3: a quote spanning several paragraphs, matched end by end.
-	//
-	// Phase 2 cannot produce the right span for such a quote, since its match
-	// never crosses a blank line. What it CAN produce is a partial one: the
-	// body paragraph of a heading+body quote may on its own score well above
-	// the floor. Phase 3 therefore runs alongside phase 2 rather than after it,
-	// and the candidates compete on score; the full-span candidate wins on the
-	// prefix it matches and the partial one does not. Phase 2 is kept because
-	// it is right when the paragraphs were merged since the anchor was made.
-	return append(candidates, findCrossBlock(d, anchor.Quote)...)
+	return candidates
 }
 
 // scoreCandidateWithCache scores a candidate with optional cached document

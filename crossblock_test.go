@@ -129,10 +129,9 @@ func TestResolveCrossBlockLooseList(t *testing.T) {
 	}
 }
 
-// A phase-2 candidate covering only the body must not beat the full span.
-// The body here is long, so on its own it scores well above the fuzzy floor
-// against the whole quote; only the full-span candidate also matches the
-// stored prefix.
+// A match covering only the body must not win over the full span. The body
+// here is long, so on its own it would score well above the fuzzy floor
+// against the whole quote.
 func TestResolveCrossBlockBeatsBodyOnlyMatch(t *testing.T) {
 	body := strings.Repeat("The service reads its settings from the environment. ", 6)
 	doc := "Intro text before the section.\n\n## Setup\n\n" + body + "\n\nAfter.\n"
@@ -183,6 +182,81 @@ func TestResolveCrossBlockOrphans(t *testing.T) {
 			doc := tc.edit(crossDoc)
 			res := Resolve(doc, anchor, nil)
 			if !res.Orphaned {
+				t.Errorf("resolved to %q at %.2f; want orphaned",
+					doc[res.Range.Start:res.Range.End], res.Confidence)
+			}
+		})
+	}
+}
+
+// A long endpoint is aligned near the block boundary and checked again at its
+// far edge; a small edit near that edge must not orphan it.
+func TestResolveCrossBlockLongEndpointEdited(t *testing.T) {
+	long := strings.Repeat("The ingest service batches writes and flushes them every second. ", 30)
+	doc := "Lead paragraph.\n\n" + long + "\n\n## Next\n\nThe end of it.\n"
+	anchor := newCrossAnchor(t, doc, "The ingest", "Next")
+
+	edited := strings.Replace(doc, "The ingest service batches", "The ingest daemon batches", 1)
+	res := Resolve(edited, anchor, nil)
+	if res.Orphaned {
+		t.Fatalf("orphaned (%s, confidence %.2f)", res.OrphanReason, res.Confidence)
+	}
+	got := edited[res.Range.Start:res.Range.End]
+	if !strings.HasPrefix(got, "The ingest daemon") || !strings.HasSuffix(got, "Next") {
+		t.Errorf("resolved to %q...%q", got[:30], got[len(got)-10:])
+	}
+}
+
+// TestResolveCrossBlockNeverMisplaces covers edits that leave the endpoints
+// intact, or nearly so, while the text the comment was about is gone. Each
+// must orphan: a comment on "Do not reboot" must never land on its opposite.
+func TestResolveCrossBlockNeverMisplaces(t *testing.T) {
+	const intro = "The maintenance window opens at six and the operator on call owns it."
+	const outro = "Afterwards the operator files a short report in the shared drive."
+	middleDoc := intro + "\n\nDo not reboot.\n\n" + outro + "\n"
+
+	long := strings.Repeat("The ingest service batches writes and flushes them every second. ", 30)
+	longDoc := "Lead paragraph.\n\n" + long + "\n\n## Next\n\nThe end of it.\n"
+	keep := len(long) - 530
+
+	tests := []struct {
+		name     string
+		doc      string
+		from, to string
+		edit     func(string) string
+	}{
+		{
+			name: "short middle rewritten",
+			doc:  middleDoc, from: "The maintenance", to: "Afterwards the operator",
+			edit: func(s string) string { return strings.Replace(s, "Do not reboot.", "Always reboot first.", 1) },
+		},
+		{
+			name: "middle deleted",
+			doc:  middleDoc, from: "The maintenance", to: "Afterwards the operator",
+			edit: func(s string) string { return strings.Replace(s, "Do not reboot.\n\n", "", 1) },
+		},
+		{
+			name: "short heading renamed",
+			doc:  "# Plan\n\nWe still have open tasks\n\n## Risks\n\nThe vendor may slip the delivery by a month.\n",
+			from: "Risks", to: "slip the delivery",
+			edit: func(s string) string { return strings.Replace(s, "## Risks", "## Hazards", 1) },
+		},
+		{
+			name: "most of a long endpoint rewritten",
+			doc:  longDoc, from: "The ingest", to: "Next",
+			edit: func(s string) string {
+				return strings.Replace(s, long[:keep], strings.Repeat("Unrelated prose about the cafeteria menu. ", 40), 1)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			anchor := newCrossAnchor(t, tc.doc, tc.from, tc.to)
+			if res := Resolve(tc.doc, anchor, nil); res.Orphaned {
+				t.Fatalf("fixture does not resolve before the edit (%.2f)", res.Confidence)
+			}
+			doc := tc.edit(tc.doc)
+			if res := Resolve(doc, anchor, nil); !res.Orphaned {
 				t.Errorf("resolved to %q at %.2f; want orphaned",
 					doc[res.Range.Start:res.Range.End], res.Confidence)
 			}
@@ -273,7 +347,8 @@ func TestCrossBlockIsBounded(t *testing.T) {
 			probeWindow := alignWindow(make([]rune, crossBlockProbeRunes))
 			endpointWindow := alignWindow(make([]rune, crossBlockEndpointRunes))
 			screening := len(d.chunks) * 2 * crossBlockProbeRunes * probeWindow
-			evaluation := crossBlockShortlist * 2 * crossBlockEndpointRunes * endpointWindow
+			// Two endpoints per pair, each aligned at both edges.
+			evaluation := crossBlockShortlist * 4 * crossBlockEndpointRunes * endpointWindow
 			if limit := screening + evaluation; al.cells > limit {
 				t.Errorf("%d cells over %d paragraphs, want <= %d", al.cells, len(d.chunks), limit)
 			}

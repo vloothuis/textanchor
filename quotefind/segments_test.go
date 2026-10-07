@@ -49,6 +49,48 @@ func TestSegments(t *testing.T) {
 			want: []string{"tests", "ship"},
 		},
 		{
+			name: "covered task item starting with emphasis keeps it balanced",
+			doc:  "Intro text.\n\n- [ ] **bold** rest\n- [x] [link](https://example.com) more\n",
+			from: "text.", to: "more",
+			want: []string{"text.", "**bold** rest", "[link](https://example.com) more"},
+		},
+		{
+			name: "covered block ending in a backslash leaves it out",
+			doc:  "Path is C:\\dir\\\n\nNext paragraph.\n",
+			from: "Path", to: "Next",
+			want: []string{"Path is C:\\dir", "Next"},
+		},
+		{
+			name: "escaped backslash at the end stays in",
+			doc:  "Ends with \\\\\n\nNext paragraph.\n",
+			from: "Ends", to: "Next",
+			want: []string{"Ends with \\\\", "Next"},
+		},
+		{
+			name: "start inside emphasis moves to its opening delimiter",
+			doc:  "Read the **important** text.\n\nNext paragraph.\n",
+			from: "portant", to: "Next",
+			want: []string{"**important** text.", "Next"},
+		},
+		{
+			name: "start inside link text moves to its opening bracket",
+			doc:  "See [the docs](https://example.com) here.\n\nNext paragraph.\n",
+			from: "docs", to: "Next",
+			want: []string{"[the docs](https://example.com) here.", "Next"},
+		},
+		{
+			name: "start inside nested emphasis moves to the outer delimiter",
+			doc:  "A ***very*** **bold *claim*** here.\n\nNext paragraph.\n",
+			from: "claim", to: "Next",
+			want: []string{"**bold *claim*** here.", "Next"},
+		},
+		{
+			name: "range inside one emphasis is left alone",
+			doc:  "Read the **important** text.\n",
+			from: "port", to: "ant",
+			want: []string{"portant"},
+		},
+		{
 			name: "covered block keeps edge emphasis balanced",
 			doc:  "Intro text.\n\n**Bold** start and *end*\n\nOutro text.\n",
 			from: "text.", to: "Outro",
