@@ -14,119 +14,28 @@ type candidate struct {
 //
 // The resolution algorithm:
 //  1. Find all exact matches for anchor.Quote
-//  2. Score each match by prefix/suffix similarity
-//  3. Apply structural context as a tiebreaker
+//  2. If there are none, find fuzzy matches: within one paragraph, and for a
+//     quote spanning several paragraphs, across them (see findCrossBlock)
+//  3. Score each candidate by prefix/suffix similarity, structural context
+//     and uniqueness
 //  4. Return the best match above the confidence threshold
 //
 // If no match meets the threshold, returns Orphaned: true.
+//
+// To resolve several anchors against one document, use [NewDocument] once and
+// [Document.Resolve] per anchor.
 func Resolve(document string, anchor Anchor, opts *ResolveOptions) ResolveResult {
-	if opts == nil {
-		opts = DefaultResolveOptions()
-	}
-
-	// Collapse once and reuse for both finding and scoring: every candidate
-	// needs the collapsed document, and rebuilding it per candidate allocates a
-	// copy of the document plus its position map each time.
-	collapsedDoc := collapseWhitespace(document)
-	candidates := findCandidates(collapsedDoc, anchor)
-
-	if len(candidates) == 0 {
-		return ResolveResult{
-			Orphaned:     true,
-			OrphanReason: "quote not found in document",
-		}
-	}
-
-	// Score candidates by context
-	for i := range candidates {
-		candidates[i].score = scoreCandidateWithCache(
-			document, anchor, candidates[i], opts, nil, nil, collapsedDoc.text,
-		)
-	}
-
-	// Find the best candidate
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c.score > best.score {
-			best = c
-		}
-	}
-
-	if best.score < opts.MinConfidence {
-		return ResolveResult{
-			Orphaned:     true,
-			OrphanReason: "confidence too low",
-			Confidence:   best.score,
-		}
-	}
-
-	return ResolveResult{
-		Range:      &Range{Start: best.rng.Start, End: best.rng.End},
-		Confidence: best.score,
-		Orphaned:   false,
-	}
+	return NewDocument(document).Resolve(anchor, opts)
 }
 
-// ResolveAll resolves multiple anchors efficiently.
-// This may be faster than calling Resolve repeatedly as it can
-// share preprocessing work.
+// ResolveAll resolves multiple anchors against one document, preparing the
+// document once.
 func ResolveAll(document string, anchors []Anchor, opts *ResolveOptions) []ResolveResult {
-	if opts == nil {
-		opts = DefaultResolveOptions()
-	}
-
+	d := NewDocument(document)
 	results := make([]ResolveResult, len(anchors))
-
-	// Pre-compute document structure for structural matching
-	// This is shared across all resolutions
-	headingPositions := extractHeadingPositions(document)
-	paragraphBoundaries := extractParagraphBoundaries(document)
-	// Collapsing is per-document work, so it is hoisted out of the loop for the
-	// same reason the structural analysis above is.
-	collapsedDoc := collapseWhitespace(document)
-
 	for i, anchor := range anchors {
-		candidates := findCandidates(collapsedDoc, anchor)
-
-		if len(candidates) == 0 {
-			results[i] = ResolveResult{
-				Orphaned:     true,
-				OrphanReason: "quote not found in document",
-			}
-			continue
-		}
-
-		// Score candidates
-		for j := range candidates {
-			candidates[j].score = scoreCandidateWithCache(
-				document, anchor, candidates[j], opts,
-				headingPositions, paragraphBoundaries, collapsedDoc.text,
-			)
-		}
-
-		// Find best
-		best := candidates[0]
-		for _, c := range candidates[1:] {
-			if c.score > best.score {
-				best = c
-			}
-		}
-
-		if best.score < opts.MinConfidence {
-			results[i] = ResolveResult{
-				Orphaned:     true,
-				OrphanReason: "confidence too low",
-				Confidence:   best.score,
-			}
-		} else {
-			results[i] = ResolveResult{
-				Range:      &Range{Start: best.rng.Start, End: best.rng.End},
-				Confidence: best.score,
-				Orphaned:   false,
-			}
-		}
+		results[i] = d.Resolve(anchor, opts)
 	}
-
 	return results
 }
 
@@ -138,11 +47,11 @@ func ResolveAll(document string, anchors []Anchor, opts *ResolveOptions) []Resol
 // rewrapped — is found by the cheap exact phase rather than falling through to
 // fuzzy matching or orphaning outright.
 //
-// The two phases differ in scope, which the comments at each explain: phase 1
-// runs over the whole collapsed document, phase 2 per paragraph. The caller
-// collapses the document once and reuses it for scoring, which is why this
-// takes the collapsed form rather than the string.
-func findCandidates(doc collapsed, anchor Anchor) []candidate {
+// The phases differ in scope, which the comments at each explain: phase 1
+// runs over the whole collapsed document, phase 2 per paragraph, phase 3
+// across paragraphs.
+func findCandidates(d *Document, anchor Anchor) []candidate {
+	doc := d.collapsed
 	var candidates []candidate
 
 	// Phase 1: Exact quote matching, whitespace-insensitive, over the whole
@@ -182,21 +91,26 @@ func findCandidates(doc collapsed, anchor Anchor) []candidate {
 	// orphans a quote it can plainly see — the very failure this package is
 	// meant to prevent. And a match becomes free to span a paragraph break it
 	// could never really have spanned.
-	if len(candidates) == 0 {
-		for _, match := range findFuzzyMatchesByParagraph(doc.original, quote) {
-			candidates = append(candidates, candidate{
-				rng:   Range{Start: match.start, End: match.end},
-				score: match.similarity * 0.8, // Penalty for fuzzy match
-			})
-		}
+	if len(candidates) > 0 {
+		return candidates
+	}
+	for _, match := range findFuzzyMatchesInChunks(d.chunks, quote) {
+		candidates = append(candidates, candidate{
+			rng:   Range{Start: match.start, End: match.end},
+			score: match.similarity * fuzzyPenalty,
+		})
 	}
 
-	return candidates
-}
-
-// scoreCandidate scores a candidate based on context matching.
-func scoreCandidate(document string, anchor Anchor, c candidate, opts *ResolveOptions) float64 {
-	return scoreCandidateWithCache(document, anchor, c, opts, nil, nil, "")
+	// Phase 3: a quote spanning several paragraphs, matched end by end.
+	//
+	// Phase 2 cannot produce the right span for such a quote, since its match
+	// never crosses a blank line. What it CAN produce is a partial one: the
+	// body paragraph of a heading+body quote may on its own score well above
+	// the floor. Phase 3 therefore runs alongside phase 2 rather than after it,
+	// and the candidates compete on score; the full-span candidate wins on the
+	// prefix it matches and the partial one does not. Phase 2 is kept because
+	// it is right when the paragraphs were merged since the anchor was made.
+	return append(candidates, findCrossBlock(d, anchor.Quote)...)
 }
 
 // scoreCandidateWithCache scores a candidate with optional cached document

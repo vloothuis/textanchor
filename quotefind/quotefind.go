@@ -18,8 +18,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
+	extast "github.com/yuin/goldmark/extension/ast"
 	"github.com/yuin/goldmark/text"
 )
 
@@ -209,21 +209,22 @@ func longestCommonSubstring(s1, s2 string) int {
 func RenderedTextWithMapping(content string) (rendered string, posMap []int) {
 	source := []byte(content)
 
-	// Parse the markdown
-	md := goldmark.New()
+	// Parse with the same GFM extensions Segments uses, so a quote is found
+	// in the same blocks its highlight is later cut into.
 	reader := text.NewReader(source)
-	doc := md.Parser().Parse(reader)
+	doc := newParser().Parse(reader)
 
 	var builder strings.Builder
 	posMap = make([]int, 0, len(content))
 
 	// Walk the AST and extract text content
-	ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
+	_ = ast.Walk(doc, func(node ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
 			// Add spacing after certain block elements
 			switch node.Kind() {
 			case ast.KindParagraph, ast.KindHeading, ast.KindListItem,
-				ast.KindFencedCodeBlock, ast.KindCodeBlock, ast.KindBlockquote:
+				ast.KindFencedCodeBlock, ast.KindCodeBlock, ast.KindBlockquote,
+				extast.KindTableCell:
 				// Add a space to separate blocks (normalized to single space)
 				if builder.Len() > 0 {
 					lastByte := builder.String()[builder.Len()-1]
