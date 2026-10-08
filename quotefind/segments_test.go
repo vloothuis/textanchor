@@ -109,16 +109,34 @@ func TestSegments(t *testing.T) {
 			want: []string{"the code.", "After"},
 		},
 		{
-			name: "inline code is cut out",
+			name: "inline code is included whole",
 			doc:  "Heading\n=======\n\nRun `make test` before pushing.\n",
 			from: "Heading", to: "pushing",
-			want: []string{"Heading", "Run", "before pushing"},
+			want: []string{"Heading", "Run `make test` before pushing"},
 		},
 		{
-			name: "double-backtick code span is cut out whole",
+			name: "double-backtick code span is included whole",
 			doc:  "Use `` a`b `` here.\n",
 			from: "Use", to: "here",
-			want: []string{"Use", "here"},
+			want: []string{"Use `` a`b `` here"},
+		},
+		{
+			name: "start inside code widens to its backtick",
+			doc:  "Run `make test` now.\n\nNext.\n",
+			from: "test", to: "Next",
+			want: []string{"`make test` now.", "Next"},
+		},
+		{
+			name: "end inside code widens to its backtick",
+			doc:  "Intro.\n\nRun `make test` now.\n",
+			from: "Intro", to: "make",
+			want: []string{"Intro.", "Run `make test`"},
+		},
+		{
+			name: "range inside one code span marks the span",
+			doc:  "Run `make test` now.\n",
+			from: "make", to: "make",
+			want: []string{"`make test`"},
 		},
 		{
 			name: "table cells are separate",

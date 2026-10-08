@@ -135,8 +135,8 @@ for _, seg := range quotefind.Segments(markdownSource, res.Range.Start, res.Rang
 ```
 
 Each segment is cut to one block's inline content, so block markup (`## `,
-`- `, `[ ] `) stays outside it, and code spans, code blocks and HTML blocks are
-left out. The parser has GitHub-flavoured tables, task lists and strikethrough
+`- `, `[ ] `) stays outside it. A code span the range touches is included whole,
+backticks and all; code blocks and HTML blocks are left out. The parser has GitHub-flavoured tables, task lists and strikethrough
 enabled, matching a GFM renderer.
 
 ## Notes
