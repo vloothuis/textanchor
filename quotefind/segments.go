@@ -44,7 +44,8 @@ type Document struct {
 // code spans inside it, and its inline containers.
 type textBlock struct {
 	content Range
-	code    []Range
+	// code holds each code span, backticks included, in source order.
+	code []Range
 	// inline holds each emphasis, link, image and strikethrough as the range
 	// from its opening delimiter to the end of its last text.
 	inline []Range
@@ -205,8 +206,9 @@ func openOf(n ast.Node, src []byte) (int, bool) {
 // inside one is kept, since an HTML parser reopens the formatting after the
 // mark closes. No segment edge sits next to an escaping backslash.
 //
-// Code is cut out: inline HTML inside a code span renders literally. Code
-// blocks and HTML blocks produce no segment at all, for the same reason.
+// A code span the range touches is included whole, since inline HTML inside a
+// code span renders literally. Code blocks and HTML blocks produce no segment
+// at all, for the same reason.
 //
 // Returns nil when the range covers no text.
 func Segments(source string, start, end int) []Range {
@@ -234,11 +236,10 @@ func (d *Document) Segments(start, end int) []Range {
 			break
 		}
 		r := Range{Start: max(start, b.content.Start), End: min(end, b.content.End)}
+		r = b.widenToCode(r)
 		r.Start = b.liftStart(r)
-		for _, piece := range subtract(r, b.code) {
-			if piece = d.clean(piece); piece.Start < piece.End {
-				out = append(out, piece)
-			}
+		if r = d.clean(r); r.Start < r.End {
+			out = append(out, r)
 		}
 	}
 	return out
@@ -294,24 +295,20 @@ func escapes(src []byte, i int) bool {
 	return n%2 == 0
 }
 
-// subtract returns r minus every range in cut, in order. cut is sorted and
-// non-overlapping, as code spans in one block are.
-func subtract(r Range, cut []Range) []Range {
-	var out []Range
-	at := r.Start
-	for _, c := range cut {
-		if c.End <= at || c.Start >= r.End {
-			continue
+// widenToCode moves an edge of r that falls inside a code span to the span's
+// delimiter, so the segment holds every code span it touches whole. Inline
+// HTML inside a code span renders literally, so a mark edge there would show
+// as text; around the whole span, backticks included, it renders as markup.
+func (b textBlock) widenToCode(r Range) Range {
+	for _, c := range b.code {
+		if c.Start < r.Start && r.Start < c.End {
+			r.Start = c.Start
 		}
-		if c.Start > at {
-			out = append(out, Range{Start: at, End: c.Start})
+		if c.Start < r.End && r.End < c.End {
+			r.End = c.End
 		}
-		at = max(at, c.End)
 	}
-	if at < r.End {
-		out = append(out, Range{Start: at, End: r.End})
-	}
-	return out
+	return r
 }
 
 // codeSpanRange returns a code span's source range INCLUDING its backticks.
