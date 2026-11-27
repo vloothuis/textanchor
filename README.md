@@ -59,6 +59,34 @@ for _, a := range anchors {
 
 `textanchor.ResolveAll(document, anchors, nil)` does the same in one call.
 
+## Review bundles and the CLI
+
+A review bundle (`.mdreview`) is a zip file with a Markdown document and the
+comments made on it. Any editor can read and write it; the format is in
+[docs/bundle-format.md](docs/bundle-format.md). The `bundle` package
+implements it in Go, and the `textanchor` command is a minimal viewer and
+editor.
+
+Install a binary from the [releases](https://github.com/vloothuis/textanchor/releases),
+or build it:
+
+```bash
+go install github.com/vloothuis/textanchor/cmd/textanchor@latest
+```
+
+```bash
+textanchor init plan.md                         # creates plan.mdreview
+textanchor add plan.mdreview --quote "every platform" -m "Still true?"
+textanchor add plan.mdreview --line 12 -m "Needs numbers."
+textanchor show plan.mdreview                   # document with highlighted comments
+textanchor reply plan.mdreview 3f9a -m "Yes."
+textanchor resolve plan.mdreview 3f9a
+textanchor merge plan.mdreview from-grace.mdreview
+textanchor update plan.mdreview plan.md         # new document text, comments follow
+```
+
+Run `textanchor help` for every command.
+
 ## What an anchor stores
 
 | Field | Purpose |
