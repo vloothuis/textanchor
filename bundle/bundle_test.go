@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -183,6 +184,11 @@ func TestReadRejects(t *testing.T) {
 		{"reply with anchor", good(comment(`{"id":"a",` + base + `,"anchor":{"quote":"q"}},{"id":"b","parent":"a",` + base + `,"anchor":{"quote":"q"}}`)), "reply has an anchor"},
 		{"nested reply", good(comment(`{"id":"a",` + base + `,"anchor":{"quote":"q"}},{"id":"b","parent":"a",` + base + `},{"id":"c","parent":"b",` + base + `}`)), "itself a reply"},
 		{"no author", good(comment(`{"id":"a","created":"2026-01-01T00:00:00Z","body":"b","anchor":{"quote":"q"}}`)), "missing author"},
+		{"long quote", good(comment(`{"id":"a",` + base + `,"anchor":{"quote":"` + strings.Repeat("q", MaxQuote+1) + `"}}`)), "quote is larger"},
+		{"long prefix", good(comment(`{"id":"a",` + base + `,"anchor":{"quote":"q","prefix":"` + strings.Repeat("p", MaxContext+1) + `"}}`)), "prefix is larger"},
+		{"long body", good(comment(`{"id":"a","author":"x","created":"2026-01-01T00:00:00Z","body":"` + strings.Repeat("b", MaxBody+1) + `","anchor":{"quote":"q"}}`)), "body is larger"},
+		{"long author", good(comment(`{"id":"a","author":"` + strings.Repeat("x", 2000) + `","created":"2026-01-01T00:00:00Z","body":"b","anchor":{"quote":"q"}}`)), "author is too long"},
+		{"too many comments", good(comment(manyComments(MaxComments + 1))), "limit is"},
 		{"no created", good(comment(`{"id":"a","author":"x","body":"b","anchor":{"quote":"q"}}`)), "missing created"},
 	}
 	for _, tt := range tests {
@@ -192,6 +198,49 @@ func TestReadRejects(t *testing.T) {
 				t.Errorf("err = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func manyComments(n int) string {
+	parts := make([]string, n)
+	for i := range parts {
+		parts[i] = fmt.Sprintf(`{"id":"c%d","author":"x","created":"2026-01-01T00:00:00Z","body":"b","anchor":{"quote":"q"}}`, i)
+	}
+	return strings.Join(parts, ",")
+}
+
+func TestEntryLimits(t *testing.T) {
+	entries := []string{ManifestName, manifest, DocumentName, doc, CommentsName, `{"comments":[]}`}
+	for i := 0; i < MaxEntries; i++ {
+		entries = append(entries, fmt.Sprintf("extra/%d", i), "")
+	}
+	if _, err := readBytes(zipOf(t, entries...)); err == nil || !strings.Contains(err.Error(), "entries") {
+		t.Errorf("entry count: %v", err)
+	}
+
+	// Unknown entries are kept raw; a stored entry's compressed size is its
+	// full size, so this exceeds the cap.
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, e := range [][2]string{{ManifestName, manifest}, {DocumentName, doc}, {CommentsName, `{"comments":[]}`}} {
+		w, _ := zw.Create(e[0])
+		w.Write([]byte(e[1]))
+	}
+	w, _ := zw.CreateHeader(&zip.FileHeader{Name: "big.bin", Method: zip.Store})
+	w.Write(make([]byte, MaxOtherEntries+1))
+	zw.Close()
+	if _, err := readBytes(buf.Bytes()); err == nil || !strings.Contains(err.Error(), "unknown entries") {
+		t.Errorf("unknown entry size: %v", err)
+	}
+}
+
+func TestUnsupportedMethodRejected(t *testing.T) {
+	data := zipOf(t, ManifestName, manifest, DocumentName, doc, CommentsName, `{"comments":[]}`)
+	// Set the method field (offset 10) of the first central directory header.
+	i := bytes.Index(data, []byte("PK\x01\x02"))
+	data[i+10] = 99
+	if _, err := readBytes(data); err == nil || !strings.Contains(err.Error(), "compression method") {
+		t.Errorf("err = %v", err)
 	}
 }
 

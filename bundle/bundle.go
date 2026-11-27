@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/vloothuis/textanchor"
 )
 
 // Format identifies the bundle format in manifest.json.
@@ -43,6 +45,10 @@ const (
 	MaxManifest    = 64 << 10
 	MaxComments    = 10000
 	MaxBody        = 64 << 10
+	// MaxQuote caps an anchor's quote. Fuzzy matching costs grow with it.
+	MaxQuote = 16 << 10
+	// MaxContext caps each of an anchor's context fields.
+	MaxContext = 4 << 10
 	// MaxOtherEntries caps the total compressed size of entries this package
 	// does not know. They are kept in memory to copy on write.
 	MaxOtherEntries = 64 << 20
@@ -304,13 +310,7 @@ func (c *Comment) validate(byID map[string]*Comment) error {
 			}
 			return errors.New("comment has no anchor")
 		}
-		if c.Anchor.Quote == "" {
-			return errors.New("anchor has an empty quote")
-		}
-		if !utf8.ValidString(c.Anchor.Quote) {
-			return errors.New("anchor quote is not valid UTF-8")
-		}
-		return nil
+		return validateAnchor(c.Anchor)
 	}
 	if c.Anchor != nil {
 		return errors.New("reply has an anchor")
@@ -324,6 +324,31 @@ func (c *Comment) validate(byID map[string]*Comment) error {
 	}
 	if p.Parent != "" {
 		return fmt.Errorf("parent %q is itself a reply", c.Parent)
+	}
+	return nil
+}
+
+func validateAnchor(a *textanchor.Anchor) error {
+	if a.Quote == "" {
+		return errors.New("anchor has an empty quote")
+	}
+	if len(a.Quote) > MaxQuote {
+		return fmt.Errorf("anchor quote is larger than %d bytes", MaxQuote)
+	}
+	fields := map[string]string{
+		"quote":               a.Quote,
+		"prefix":              a.Prefix,
+		"suffix":              a.Suffix,
+		"containing_sentence": a.ContainingSentence,
+		"heading_context":     a.HeadingContext,
+	}
+	for name, v := range fields {
+		if name != "quote" && len(v) > MaxContext {
+			return fmt.Errorf("anchor %s is larger than %d bytes", name, MaxContext)
+		}
+		if !utf8.ValidString(v) {
+			return fmt.Errorf("anchor %s is not valid UTF-8", name)
+		}
 	}
 	return nil
 }

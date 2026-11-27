@@ -156,8 +156,10 @@ The reference implementation rejects a bundle when:
 - the archive holds more than 1,000 entries,
 - `document.md` or `comments.json` exceeds 16 MiB uncompressed,
 - `manifest.json` exceeds 64 KiB,
-- there are more than 10,000 comments and replies, or
-- a `body` exceeds 64 KiB.
+- unknown entries exceed 64 MiB compressed, in total,
+- there are more than 10,000 comments and replies,
+- a `body` exceeds 64 KiB, an `author` 1 KiB or an `id` 64 characters, or
+- an anchor's `quote` exceeds 16 KiB, or one of its other fields 4 KiB.
 
 ## Security
 

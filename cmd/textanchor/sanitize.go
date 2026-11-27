@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -51,23 +52,21 @@ func isClean(s string) bool {
 	return true
 }
 
-// unsafeRune reports C1 controls, bidirectional formatting characters,
-// zero-width characters and line or paragraph separators. Each can make the
-// displayed text differ from the stored text.
+// unsafeRune reports C1 controls, format characters (Unicode category Cf:
+// bidirectional controls, zero-width and other invisible characters) and line
+// or paragraph separators. Each can make the displayed text differ from the
+// stored text. The zero-width joiner U+200D is allowed, because emoji
+// sequences need it.
 func unsafeRune(r rune) bool {
 	switch {
 	case r >= 0x80 && r <= 0x9f:
 		return true
-	case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
-		return true
-	case r == 0x200e || r == 0x200f || r == 0x061c:
-		return true
-	case r == 0x200b || r == 0x200c || r == 0x2060 || r == 0xfeff: // U+200D stays: emoji sequences use it
-		return true
+	case r == 0x200d:
+		return false
 	case r == 0x2028 || r == 0x2029:
 		return true
 	}
-	return false
+	return unicode.Is(unicode.Cf, r)
 }
 
 // singleLine sanitizes s and folds it onto one line, for names and previews.

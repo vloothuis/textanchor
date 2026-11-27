@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"os"
@@ -254,6 +255,27 @@ func TestHostileBundle(t *testing.T) {
 	}
 }
 
+// TestHostileEntryNameInError checks that an error quoting an entry name
+// from a bundle is sanitized.
+func TestHostileEntryNameInError(t *testing.T) {
+	h := newHarness(t)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for _, name := range []string{"manifest.json", "document.md", "x\x1b]0;pwned\x07", "X\x1b]0;PWNED\x07"} {
+		w, _ := zw.Create(name)
+		w.Write([]byte("{}"))
+	}
+	zw.Close()
+	os.WriteFile(h.path("names.mdreview"), buf.Bytes(), 0o644)
+	_, errs, code := h.runIn("", "show", "@names.mdreview")
+	if code != 1 || !strings.Contains(errs, "same name") {
+		t.Fatalf("exit %d: %q", code, errs)
+	}
+	if strings.ContainsAny(errs, "\x1b\x07") {
+		t.Errorf("stderr contains control characters: %q", errs)
+	}
+}
+
 // stripOwnSGR removes the colour codes the tool itself emits.
 func stripOwnSGR(s string) string {
 	for _, code := range []string{sgrDim, sgrHeading, sgrCode, sgrHighlight, sgrMarker, sgrAuthor, sgrResolved, sgrOrphan, "0"} {
@@ -291,6 +313,9 @@ func TestSanitize(t *testing.T) {
 		"rtl\u202eabc":                 `rtl\u{202e}abc`,
 		"iso\u2066x\u2069":             `iso\u{2066}x\u{2069}`,
 		"zw\u200bsp":                   `zw\u{200b}sp`,
+		"tag\U000E0041":                `tag\u{e0041}`,
+		"shy\u00ad":                    `shy\u{00ad}`,
+		"inv\u2062":                    `inv\u{2062}`,
 		"bad\xffutf8":                  "bad\ufffdutf8",
 		"emoji 👩\u200d💻 and accents é": "emoji 👩\u200d💻 and accents é",
 		"cr\r":                         `cr\x0d`,
