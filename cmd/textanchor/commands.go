@@ -308,7 +308,12 @@ func cmdExtract(e *env, args []string) error {
 		return err
 	}
 	if *out == "" {
-		_, err := io.WriteString(e.stdout, b.Document)
+		// A pipe or file gets the exact bytes; a terminal gets sanitized text.
+		text := b.Document
+		if e.isTerminal() {
+			text = sanitize(text)
+		}
+		_, err := io.WriteString(e.stdout, text)
 		return err
 	}
 	return createFile(*out, *force, func(w io.Writer) error {

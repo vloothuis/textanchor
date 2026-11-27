@@ -262,6 +262,25 @@ func stripOwnSGR(s string) string {
 	return s
 }
 
+func TestExtractToTerminalIsSanitized(t *testing.T) {
+	h := newHarness(t)
+	if err := bundle.New("a\x1b]52;c;eA==\x07b\n").Save(h.path("evil.mdreview")); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	e := &env{stdout: &out, stderr: &out, isTerminal: func() bool { return true }, getenv: func(string) string { return "" }}
+	if code := run(e, []string{"extract", h.path("evil.mdreview")}); code != 0 {
+		t.Fatalf("exit %d: %s", code, out.String())
+	}
+	if strings.ContainsAny(out.String(), "\x1b\x07") || !strings.Contains(out.String(), `\x1b]52`) {
+		t.Errorf("terminal output = %q", out.String())
+	}
+	// A pipe gets the exact bytes.
+	if got, _, _ := h.runIn("", "extract", "@evil.mdreview"); got != "a\x1b]52;c;eA==\x07b\n" {
+		t.Errorf("piped output = %q", got)
+	}
+}
+
 func TestSanitize(t *testing.T) {
 	tests := map[string]string{
 		"plain text\twith tab\n":       "plain text\twith tab\n",
